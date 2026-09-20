@@ -347,9 +347,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
         batch = scheduler_output.lwd_batch
         n_emb, n_unemb = self._lwd_queue_mix()
         logger.info(
-            "[Lwd][sched] edge dispatch-embed seqno=%d req=%s tokens=%d "
+            "[Lwd][sched] edge dispatch-embed seqno=%d reqs=%s tokens=%d "
             "ahead_unemb=%d ahead_emb=%d c2e_pending=%d",
-            batch.seqno, batch.batch_meta.req_ids[0],
+            batch.seqno, batch.batch_meta.req_ids,
             scheduler_output.total_num_scheduled_tokens,
             n_unemb, n_emb, self.lwd_c2e_meta_queue.qsize(),
         )
