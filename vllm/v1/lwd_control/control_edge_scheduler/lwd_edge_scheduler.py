@@ -190,9 +190,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
           c = min(剩余, C);装不下剩余 cap 的续传等下步(cap 排水回升
           后仍最优先),余量允许开新(自限块不影响云侧复现);
           队首续传连一个单元都装不下且批仍为空时,单独截断成
-          min(剩余, cap) 放行(cap 截断块必须独占一批:云侧按批内
-          最大条目覆写阈值复现 chunk 边界,截断块与更大的块同批会被
-          云侧超排,设计 §2.4);
+          min(剩余, cap) 放行(截断块独占一批,设计 §2.4);
         - 开新:waiting(skipped 优先,原生准入失败回插者)按 FCFS
           迭代序取前缀,c = min(prompt, C),满足 Σchunk ≤ cap 且
           新增请求数 ≤ free_seq;队首装不下即停(不跳过队首,保 FCFS
@@ -201,6 +199,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
           截断成 min(prompt, cap) 放行(独占一批,同续传的 §2.4
           纪律)——否则在途 decode 把 cap 压到 C 以下时大 prompt
           永不可开新,流水线全程串行;
+        - cap 截断块的相容拼批(§2.4 放宽):批非空时不舍余量——若批内
+          已有块全部 R-定界(c == 剩余,即尾块/整短 prompt,被自身 R
+          夹住与 T 无关)且截断块为批内最大(T=max(items)=c_trunc
+          恰好等于其 cap 定界尺寸),则允许以 min(剩余, cap−used)
+          拼入收尾;任一条件不满足退回「不塞截断块」。典型形态:
+          C=B 时「尾块 10 + 下一请求首块 8181」同批;
         priority 调度策略下 waiting 迭代序非弹出序,本前缀语义未适配
         (LWD 部署恒 FCFS,设计 M-10)。"""
         # 逃生通道(旧相位语义):单请求、不 cap、允许原生截断成 chunk、
@@ -223,6 +227,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if cap < 1:
             return picked, expected, cap
         unit = self._lwd_chunk_unit
+        max_chunk = 0  # 批内最大 chunk(相容截断判定用,见下)
+        all_r_limited = True  # 批内 chunk 是否全部 R-定界(c == 该请求剩余)
         # 1) 续传优先(先收尾再开新)
         for request in self.running:
             remaining = (
@@ -233,7 +239,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             chunk = min(remaining, unit)
             if used + chunk > cap:
                 if picked:
-                    break  # 批非空:不塞截断块,不跳过续传
+                    # 相容截断(§2.4 放宽):批内全是 R-定界尾块且截断块
+                    # 为批内最大,则允许拼入——R-定界块被自身 R 夹住
+                    # (云侧 min(R_i, T, 预算) 恒等于 c_i,与 T 无关),
+                    # 截断块被 T=max(items)=c_trunc 夹住,各自精确复现。
+                    # 典型形态:C=B 时「尾块 10 + 下一请求首块 8181」
+                    c_trunc = cap - used
+                    if all_r_limited and 1 <= c_trunc and c_trunc >= max_chunk:
+                        picked.append(request.request_id)
+                        expected[request.request_id] = c_trunc
+                    break  # 截断后预算耗尽,批收尾;不跳过续传
                 # 队首续传连一个单元都装不下:单独截断放行,
                 # 独占一批(设计 §2.4),本批不再续传也不再开新
                 picked.append(request.request_id)
@@ -242,6 +257,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             picked.append(request.request_id)
             expected[request.request_id] = chunk
             used += chunk
+            max_chunk = max(max_chunk, chunk)
+            all_r_limited = all_r_limited and chunk == remaining
         # 2) 开新:FCFS 前缀,自限 chunk
         new_count = 0
         candidates = list(self.skipped_waiting) + list(self.waiting)
@@ -251,7 +268,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 break
             if used + chunk > cap:
                 if picked:
-                    break  # 批非空:不塞截断块,不跳过续传(§2.4)
+                    # 相容截断,同续传分支(§2.4 放宽)
+                    c_trunc = cap - used
+                    if all_r_limited and 1 <= c_trunc and c_trunc >= max_chunk:
+                        picked.append(request.request_id)
+                        expected[request.request_id] = c_trunc
+                    break
                 # 队首开新连一个单元都装不下且批为空:单独截断成
                 # min(prompt, cap) 放行,独占一批(同 §2.4 纪律)。
                 # 无此逃生,任一在途请求(含 decode 中的 awaiting)把
@@ -266,6 +288,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             expected[request.request_id] = chunk
             used += chunk
             new_count += 1
+            max_chunk = max(max_chunk, chunk)
+            all_r_limited = (
+                all_r_limited and chunk == request.num_prompt_tokens
+            )
         return picked, expected, cap
 
     def _lwd_schedule_batch(self) -> SchedulerOutput:
