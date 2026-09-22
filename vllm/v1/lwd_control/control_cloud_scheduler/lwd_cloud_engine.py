@@ -96,8 +96,17 @@ class LwdCloudEngineCore(EngineCoreProc):
             bind=False,
             encoder=lwd_encode_cloud_notify,
         )
+        sched_config = self.vllm_config.scheduler_config
+        spec_config = getattr(self.vllm_config, "speculative_config", None)
         self._lwd_hello = LwdHelloNotify(
-            pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
+            pre_out_host=config.pre_out_host,
+            pre_out_port=config.pre_out_port,
+            # 调度三元组供边侧互校(cap/preflight 公式的同源输入)
+            max_num_batched_tokens=sched_config.max_num_batched_tokens,
+            max_num_seqs=sched_config.max_num_seqs,
+            num_speculative_tokens=(
+                getattr(spec_config, "num_speculative_tokens", None) or 0
+            ),
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
