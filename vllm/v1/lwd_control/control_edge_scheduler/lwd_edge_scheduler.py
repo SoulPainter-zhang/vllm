@@ -197,7 +197,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
           迭代序取前缀,c = min(prompt, C),满足 Σchunk ≤ cap 且
           新增请求数 ≤ free_seq;队首装不下即停(不跳过队首,保 FCFS
           与 seqno 链次序;超长 prompt 按 C 切块续传,不再队首阻塞,
-          设计 M-1 解药)。
+          设计 M-1 解药);队首连一个单元都装不下且批仍为空时,单独
+          截断成 min(prompt, cap) 放行(独占一批,同续传的 §2.4
+          纪律)——否则在途 decode 把 cap 压到 C 以下时大 prompt
+          永不可开新,流水线全程串行;
         priority 调度策略下 waiting 迭代序非弹出序,本前缀语义未适配
         (LWD 部署恒 FCFS,设计 M-10)。"""
         # 逃生通道(旧相位语义):单请求、不 cap、允许原生截断成 chunk、
@@ -244,7 +247,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         candidates = list(self.skipped_waiting) + list(self.waiting)
         for request in candidates:
             chunk = min(request.num_prompt_tokens, unit)
-            if new_count >= free_seq or used + chunk > cap:
+            if new_count >= free_seq:
+                break
+            if used + chunk > cap:
+                if picked:
+                    break  # 批非空:不塞截断块,不跳过续传(§2.4)
+                # 队首开新连一个单元都装不下且批为空:单独截断成
+                # min(prompt, cap) 放行,独占一批(同 §2.4 纪律)。
+                # 无此逃生,任一在途请求(含 decode 中的 awaiting)把
+                # cap 压到 C 以下时,大 prompt 的新开永远装不进批,
+                # prefill 停摆、边云流水线退化为全程串行(真机已现:
+                # decode 阶段云侧只剩 1-2 个请求在跑)
+                chunk = min(request.num_prompt_tokens, cap)
+                picked.append(request.request_id)
+                expected[request.request_id] = chunk
                 break
             picked.append(request.request_id)
             expected[request.request_id] = chunk
