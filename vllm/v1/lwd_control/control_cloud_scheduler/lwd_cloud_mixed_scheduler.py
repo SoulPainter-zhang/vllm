@@ -330,12 +330,36 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"(chunk 断流/重复/乱序)"
                 )
         req_ids = decode_ids + [item.request_id for item in items]
-        # decode 精确消耗(非 spec_factor 上界):预算钳制的精确性依赖
-        # 它——高估会在末位截断块上留下余量使其被超排。async 关闭前提
-        # 下 num_new = 1 + len(spec_token_ids) 逐字成立
-        decode_exact = sum(
-            1 + len(self.requests[rid].spec_token_ids) for rid in decode_ids
-        )
+        # decode 精确消耗:预算钳制的精确性依赖逐字复刻原生 running 段
+        # (scheduler.py:381-416)的 num_new 推导——1+len(spec) 不是准确式:
+        # ① placeholder(spec 拒绝遗留的非零值)计入排程窗口;
+        # ② max_tokens 守卫(占位>0 且距 max_tokens 不足 2)与
+        #   next_decode_eligible_step 会让请求整步跳过、消耗 0。
+        # 不逐字复刻就会留下余量,使末位截断块被超排(真机实录:
+        # decode 请求被守卫跳过消耗 0,末位块 604 被排成 608)。
+        # threshold 不约束 decode(正常量级 T ≫ num_new,病态小 chunk
+        # 配置见设计 §8-C9);预算由构造保证充足,不影响本推导。
+        decode_exact = 0
+        for rid in decode_ids:
+            req = self.requests[rid]
+            placeholders = req.num_output_placeholders
+            if (
+                placeholders > 0
+                and req.num_computed_tokens + 2 - placeholders
+                >= req.num_prompt_tokens + req.max_tokens
+            ):
+                continue  # 原生 max_tokens 守卫:本步跳过,消耗 0
+            if self.current_step < req.next_decode_eligible_step:
+                continue  # V2+PP 节拍守卫:本步跳过,消耗 0
+            decode_exact += max(
+                0,
+                min(
+                    req.num_tokens_with_spec
+                    + placeholders
+                    - req.num_computed_tokens,
+                    self.max_model_len - 1 - req.num_computed_tokens,
+                ),
+            )
         saved_threshold = self.scheduler_config.long_prefill_token_threshold
         saved_budget = self.max_num_scheduled_tokens
         self.scheduler_config.long_prefill_token_threshold = max(
