@@ -237,6 +237,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 if c >= 1:
                     picked.append(request.request_id)
                     expected[request.request_id] = c
+                    used += c  # 截断块同样占预算,漏记会被新开循环超批
                 break
             picked.append(request.request_id)
             expected[request.request_id] = chunk
@@ -256,11 +257,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 if c >= 1:
                     picked.append(request.request_id)
                     expected[request.request_id] = c
+                    used += c
                 break
             picked.append(request.request_id)
             expected[request.request_id] = chunk
             used += chunk
             new_count += 1
+        # 组批自洽:截断分支同样记账,任何路径下 Σexpected == used ≤ cap
+        # (真机实录:截断分支漏记 used,新开循环按陈旧余量超批 2×cap)
+        total = sum(expected.values())
+        assert total == used and total <= cap, (
+            f"[Lwd][edge-sched] picker budget overflow: "
+            f"Σexpected={total} used={used} cap={cap}"
+        )
         return picked, expected, cap
 
     def _lwd_schedule_batch(self) -> SchedulerOutput:
