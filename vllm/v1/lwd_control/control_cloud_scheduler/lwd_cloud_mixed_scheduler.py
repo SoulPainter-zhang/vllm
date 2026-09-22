@@ -306,9 +306,12 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         关闭前提下调度时刻即真实水位)——不等即 chunk 断流(>)/
         重复(<)/乱序,协议级事故 fail-fast,不当场炸就会把
         embeddings 注入错位窗口静默错算。
-        阈值复现(设计 §2.3):临时覆写 long_prefill_token_threshold =
-        max(items.num_tokens),原生调度的 threshold 截断逐请求复现
-        边侧 chunk 边界(自限 chunk,与处理顺序无关);finally 恢复。
+        双钳制复现(设计 §2.3/§2.4 修订):① 阈值复现——临时覆写
+        long_prefill_token_threshold = max(items.num_tokens),非末位
+        自限块由 R/C/T 定界逐请求复现;② 预算钳制——临时把
+        max_num_scheduled_tokens 压到 decode 精确消耗 + Σ chunk,
+        末位 cap 截断块由"预算耗尽"复现(与集中式 chunked prefill
+        的截断语义逐字对齐)。两个 finally 均恢复。
         注意 decode 请求 num_new = 1+k 远小于正常量级的 T,不受覆写
         影响(病态小 chunk 配置见设计 §8-C9)。"""
         logger.info(
@@ -327,8 +330,18 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"(chunk 断流/重复/乱序)"
                 )
         req_ids = decode_ids + [item.request_id for item in items]
+        # decode 精确消耗(非 spec_factor 上界):预算钳制的精确性依赖
+        # 它——高估会在末位截断块上留下余量使其被超排。async 关闭前提
+        # 下 num_new = 1 + len(spec_token_ids) 逐字成立
+        decode_exact = sum(
+            1 + len(self.requests[rid].spec_token_ids) for rid in decode_ids
+        )
         saved_threshold = self.scheduler_config.long_prefill_token_threshold
+        saved_budget = self.max_num_scheduled_tokens
         self.scheduler_config.long_prefill_token_threshold = max(
+            item.num_tokens for item in items
+        )
+        self.max_num_scheduled_tokens = decode_exact + sum(
             item.num_tokens for item in items
         )
         try:
@@ -337,6 +350,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             self.scheduler_config.long_prefill_token_threshold = (
                 saved_threshold
             )
+            self.max_num_scheduled_tokens = saved_budget
         self._lwd_verify_full_admission(out, notify, items)
         # 消费队首:abort 清扫(IO 线程)可能整体替换过 deque,按对象
         # 身份弹队首,避免错弹替换后的新队首

@@ -185,26 +185,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
         chunk 语义(lwd_chunked_prefill_design.md §3.1):
         - 每个 chunk 自限:c = min(剩余 prompt, chunk 单元 C),云侧原生
-          调度在阈值复现下逐请求推出同一边界,无需逐请求钳制通道;
+          调度在阈值复现(T=批内最大)下逐请求推出同一边界;
         - 续传(先收尾再开新):running 中未发完的 prefill 按 FCFS 序取
-          c = min(剩余, C);装不下剩余 cap 的续传等下步(cap 排水回升
-          后仍最优先),余量允许开新(自限块不影响云侧复现);
-          队首续传连一个单元都装不下且批仍为空时,单独截断成
-          min(剩余, cap) 放行(截断块独占一批,设计 §2.4);
+          c = min(剩余, C),Σ ≤ cap;
         - 开新:waiting(skipped 优先,原生准入失败回插者)按 FCFS
           迭代序取前缀,c = min(prompt, C),满足 Σchunk ≤ cap 且
-          新增请求数 ≤ free_seq;队首装不下即停(不跳过队首,保 FCFS
-          与 seqno 链次序;超长 prompt 按 C 切块续传,不再队首阻塞,
-          设计 M-1 解药);队首连一个单元都装不下且批仍为空时,单独
-          截断成 min(prompt, cap) 放行(独占一批,同续传的 §2.4
-          纪律)——否则在途 decode 把 cap 压到 C 以下时大 prompt
-          永不可开新,流水线全程串行;
-        - cap 截断块的相容拼批(§2.4 放宽):批非空时不舍余量——若批内
-          已有块全部 R-定界(c == 剩余,即尾块/整短 prompt,被自身 R
-          夹住与 T 无关)且截断块为批内最大(T=max(items)=c_trunc
-          恰好等于其 cap 定界尺寸),则允许以 min(剩余, cap−used)
-          拼入收尾;任一条件不满足退回「不塞截断块」。典型形态:
-          C=B 时「尾块 10 + 下一请求首块 8181」同批;
+          新增请求数 ≤ free_seq;不跳过队首(保 FCFS 与 seqno 链次序);
+        - 末位截断(续传/新开共用):批内最后一个条目允许被剩余额度
+          截尾成 cap−used,与集中式 chunked prefill 的"预算耗尽截断"
+          逐语义对齐——截断块恒为末位,边侧(§2.5)与云侧(§2.3)的
+          预算钳制都靠预算耗尽精确复现它,非末位块由 R/C/T 定界与
+          截断块尺寸无关。无此逃生,在途 decode 把 cap 压到 C 以下时
+          大 prompt 永不可开新,流水线全程串行;
         priority 调度策略下 waiting 迭代序非弹出序,本前缀语义未适配
         (LWD 部署恒 FCFS,设计 M-10)。"""
         # 逃生通道(旧相位语义):单请求、不 cap、允许原生截断成 chunk、
@@ -227,8 +219,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if cap < 1:
             return picked, expected, cap
         unit = self._lwd_chunk_unit
-        max_chunk = 0  # 批内最大 chunk(相容截断判定用,见下)
-        all_r_limited = True  # 批内 chunk 是否全部 R-定界(c == 该请求剩余)
         # 1) 续传优先(先收尾再开新)
         for request in self.running:
             remaining = (
@@ -238,28 +228,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 continue
             chunk = min(remaining, unit)
             if used + chunk > cap:
-                if picked:
-                    # 相容截断(§2.4 放宽):批内全是 R-定界尾块且截断块
-                    # 为批内最大,则允许拼入——R-定界块被自身 R 夹住
-                    # (云侧 min(R_i, T, 预算) 恒等于 c_i,与 T 无关),
-                    # 截断块被 T=max(items)=c_trunc 夹住,各自精确复现。
-                    # 典型形态:C=B 时「尾块 10 + 下一请求首块 8181」
-                    c_trunc = cap - used
-                    if all_r_limited and 1 <= c_trunc and c_trunc >= max_chunk:
-                        picked.append(request.request_id)
-                        expected[request.request_id] = c_trunc
-                    break  # 截断后预算耗尽,批收尾;不跳过续传
-                # 队首续传连一个单元都装不下:单独截断放行,
-                # 独占一批(设计 §2.4),本批不再续传也不再开新
-                picked.append(request.request_id)
-                expected[request.request_id] = min(remaining, cap)
-                return picked, expected, cap
+                # 末位截断:批内最后一个条目允许被剩余额度截尾,
+                # 批收尾(预算耗尽,与集中式 chunked prefill 逐语义
+                # 对齐)。复现依据:截断块恒为末位,边侧预算钳制
+                # (§2.5)与云侧预算钳制(§2.3)都靠"预算耗尽"复现它;
+                # 非末位块由 R/C/T 定界,与截断块尺寸无关
+                c = cap - used
+                if c >= 1:
+                    picked.append(request.request_id)
+                    expected[request.request_id] = c
+                break
             picked.append(request.request_id)
             expected[request.request_id] = chunk
             used += chunk
-            max_chunk = max(max_chunk, chunk)
-            all_r_limited = all_r_limited and chunk == remaining
-        # 2) 开新:FCFS 前缀,自限 chunk
+        # 2) 开新:FCFS 前缀,自限 chunk;装不下时同上末位截断。
+        # 无截断逃生时,任一在途请求(含 decode 中的 awaiting)把 cap
+        # 压到 C 以下会让大 prompt 永不可开新、流水线全程串行(真机
+        # 已现:decode 阶段云侧只剩 1-2 个请求在跑)
         new_count = 0
         candidates = list(self.skipped_waiting) + list(self.waiting)
         for request in candidates:
@@ -267,31 +252,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if new_count >= free_seq:
                 break
             if used + chunk > cap:
-                if picked:
-                    # 相容截断,同续传分支(§2.4 放宽)
-                    c_trunc = cap - used
-                    if all_r_limited and 1 <= c_trunc and c_trunc >= max_chunk:
-                        picked.append(request.request_id)
-                        expected[request.request_id] = c_trunc
-                    break
-                # 队首开新连一个单元都装不下且批为空:单独截断成
-                # min(prompt, cap) 放行,独占一批(同 §2.4 纪律)。
-                # 无此逃生,任一在途请求(含 decode 中的 awaiting)把
-                # cap 压到 C 以下时,大 prompt 的新开永远装不进批,
-                # prefill 停摆、边云流水线退化为全程串行(真机已现:
-                # decode 阶段云侧只剩 1-2 个请求在跑)
-                chunk = min(request.num_prompt_tokens, cap)
-                picked.append(request.request_id)
-                expected[request.request_id] = chunk
+                c = cap - used
+                if c >= 1:
+                    picked.append(request.request_id)
+                    expected[request.request_id] = c
                 break
             picked.append(request.request_id)
             expected[request.request_id] = chunk
             used += chunk
             new_count += 1
-            max_chunk = max(max_chunk, chunk)
-            all_r_limited = (
-                all_r_limited and chunk == request.num_prompt_tokens
-            )
         return picked, expected, cap
 
     def _lwd_schedule_batch(self) -> SchedulerOutput:
