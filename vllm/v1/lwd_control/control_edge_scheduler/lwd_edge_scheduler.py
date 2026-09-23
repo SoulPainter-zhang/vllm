@@ -424,6 +424,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         mrope_features = [
             f for f in request.mm_features if f.modality != "prompt_embeds"
         ]
+        _t_mrope = time.monotonic()
         positions, _delta = self._lwd_mrope_positions_fn(
             input_tokens=list(request.prompt_token_ids),
             mm_features=mrope_features,
@@ -434,9 +435,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             f"len {request.num_prompt_tokens} (request {request.request_id})"
         )
         self._lwd_mrope_positions_dict[request.request_id] = positions
+        # [Lwd][perf] mrope 全 prompt 计算逐请求耗时(在边引擎主线程上,
+        # 期间调度循环停转;MM 劣化归因)
         logger.info(
-            "[Lwd][edge-sched] mrope positions computed: req=%s prompt=%d",
+            "[Lwd][perf] mrope-compute req=%s prompt=%d dur=%.2fms",
             request.request_id, request.num_prompt_tokens,
+            (time.monotonic() - _t_mrope) * 1000,
         )
 
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
