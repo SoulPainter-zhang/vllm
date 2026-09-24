@@ -65,6 +65,12 @@ logger = init_logger(__name__)
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
+# 云侧 pending 上限(awaiting 中未收到首 token 的请求数):超限即停止
+# 新开 prefill——请求在边侧 waiting 攒批(picker FCFS 前缀天然组多
+# 请求批),云侧 pending 排空后闸门自开。等于把云侧 notify 积压挪回
+# 边侧变成可组批的队列深度。
+_LWD_MAX_PENDING_PREFILL = 8
+
 
 class LwdEdgeScheduler(LwdBaseScheduler):
     """纯 prefill 调度语义 + 控制面出口(notify/abort/seqno)。"""
@@ -102,6 +108,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
+        # 已收到首个 token 的请求集合:awaiting 中不在此集合的请求 =
+        # 云侧尚未消费到其 prefill(pending_notify 的边侧本地估计,
+        # 免新增协议字段);首个 c2e 到达即标记,完结/abort 时清除。
+        self._lwd_first_token_seen: set[str] = set()
+        # pending 闸门状态(仅作开/关转换日志用)
+        self._lwd_prefill_gate_held: bool = False
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
         # 同样占预算与 KV);k = num_speculative_tokens(配置解析期已
         # 求值,缺省 None 按 0),无 spec 配置即 1。
@@ -171,6 +183,31 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             and not self._lwd_has_prefill_chunk_inflight()
         ):
             return SchedulerOutput.make_empty()
+        # 云侧 pending 闸门(组批的产生机制):awaiting 中尚未收到首个
+        # token 的请求数 = 云侧尚未消费到的 prefill(notify 积压的边侧
+        # 本地估计,免协议改动)。超过上限即停止新开 prefill,请求在边
+        # 侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧
+        # pending 排空后闸门自开。续传豁免(先收尾再开新)。
+        if self._lwd_mixed and not self._lwd_has_prefill_chunk_inflight():
+            pending_cloud = sum(
+                1 for rid in self._lwd_awaiting
+                if rid not in self._lwd_first_token_seen
+            )
+            if pending_cloud >= _LWD_MAX_PENDING_PREFILL:
+                if not self._lwd_prefill_gate_held:
+                    self._lwd_prefill_gate_held = True
+                    logger.info(
+                        "[Lwd][edge-sched] prefill gate HOLD: "
+                        "pending_cloud=%d >= %d",
+                        pending_cloud, _LWD_MAX_PENDING_PREFILL,
+                    )
+                return SchedulerOutput.make_empty()
+            if self._lwd_prefill_gate_held:
+                self._lwd_prefill_gate_held = False
+                logger.info(
+                    "[Lwd][edge-sched] prefill gate OPEN: pending_cloud=%d",
+                    pending_cloud,
+                )
         return self._lwd_schedule_batch()
 
     def _lwd_pick_prefill_batch(
@@ -606,6 +643,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         publisher = self.lwd_edge_publisher
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
+            self._lwd_first_token_seen.discard(request_id)
             self._lwd_mrope_positions_dict.pop(request_id, None)
             if publisher is None:
                 continue
@@ -669,8 +707,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 request_id,
             )
             return False
+        self._lwd_first_token_seen.add(request_id)
         if finished:
             del self._lwd_awaiting[request_id]
+            self._lwd_first_token_seen.discard(request_id)
         logger.info(
             "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
             request_id, len(token_ids), finished,
