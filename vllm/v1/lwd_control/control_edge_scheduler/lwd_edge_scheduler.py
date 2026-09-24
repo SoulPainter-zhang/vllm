@@ -191,6 +191,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         - 开新:waiting(skipped 优先,原生准入失败回插者)按 FCFS
           迭代序取前缀,c = min(prompt, C),满足 Σchunk ≤ cap 且
           新增请求数 ≤ free_seq;不跳过队首(保 FCFS 与 seqno 链次序);
+        - DeepSeek V4 总 prompt 长度 >=8000 的请求独占 prefill 批
+          (含续传);短请求允许合批,不限制云侧 decode 混排;
         - 末位截断(续传/新开共用):批内最后一个条目允许被剩余额度
           截尾成 cap−used,与集中式 chunked prefill 的"预算耗尽截断"
           逐语义对齐——截断块恒为末位,边侧(§2.5)与云侧(§2.3)的
@@ -219,13 +221,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if cap < 1:
             return picked, expected, cap
         unit = self._lwd_chunk_unit
+        # Apply the limit before scheduling/publishing so RangeNotify and the
+        # embeddings payload retain identical request sets and token counts.
+        is_deepseek_v4 = (
+            self.vllm_config.model_config.hf_text_config.model_type == "deepseek_v4"
+        )
+        single_prefill = False
         # 1) 续传优先(先收尾再开新)
         for request in self.running:
+            if single_prefill and picked:
+                break
             remaining = (
                 request.num_prompt_tokens - request.num_computed_tokens
             )
             if remaining <= 0:
                 continue
+            # Use the full prompt length, not this chunk's remaining length.
+            # If a long request follows short ones, close the batch here and
+            # leave it for the next batch; do not bypass it with waiting work.
+            single_prefill = is_deepseek_v4 and request.num_prompt_tokens >= 8000
+            if single_prefill and picked:
+                break
             chunk = min(remaining, unit)
             if used + chunk > cap:
                 # 末位截断:批内最后一个条目允许被剩余额度截尾,
@@ -249,6 +265,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         new_count = 0
         candidates = list(self.skipped_waiting) + list(self.waiting)
         for request in candidates:
+            if single_prefill and picked:
+                break
+            single_prefill = is_deepseek_v4 and request.num_prompt_tokens >= 8000
+            if single_prefill and picked:
+                break
             chunk = min(request.num_prompt_tokens, unit)
             if new_count >= free_seq:
                 break
