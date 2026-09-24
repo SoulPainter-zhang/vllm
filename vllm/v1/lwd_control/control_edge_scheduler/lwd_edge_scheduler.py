@@ -65,11 +65,12 @@ logger = init_logger(__name__)
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
-# 云侧 pending 上限(awaiting 中未收到首 token 的请求数):超限即停止
-# 新开 prefill——请求在边侧 waiting 攒批(picker FCFS 前缀天然组多
-# 请求批),云侧 pending 排空后闸门自开。等于把云侧 notify 积压挪回
-# 边侧变成可组批的队列深度。
-_LWD_MAX_PENDING_PREFILL = 8
+# 云侧 pending 上限,按未消费 chunk(seqno)计:一条 seqno = 一个云步
+# 消费单位。边侧记录 seqno -> 批内请求列表,批内全部请求收到首 token
+# 即该 chunk 已消费;未消费 chunk 数达到上限即停止新开 prefill——请求
+# 在边侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧 pending
+# 排空后闸门自开。
+_LWD_MAX_PENDING_CHUNKS = 3
 
 
 class LwdEdgeScheduler(LwdBaseScheduler):
@@ -112,6 +113,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 云侧尚未消费到其 prefill(pending_notify 的边侧本地估计,
         # 免新增协议字段);首个 c2e 到达即标记,完结/abort 时清除。
         self._lwd_first_token_seen: set[str] = set()
+        # seqno -> 批内 request_id 列表(chunk 粒度 pending 跟踪):
+        # 批内全部请求收到首 token 即整条移除;abort 时按请求摘除,
+        # 摘空即移除。云侧 pending_notify 的边侧本地镜像,免协议改动。
+        self._lwd_batch_requests: dict[int, list[str]] = {}
         # pending 闸门状态(仅作开/关转换日志用)
         self._lwd_prefill_gate_held: bool = False
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
@@ -189,24 +194,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧
         # pending 排空后闸门自开。续传豁免(先收尾再开新)。
         if self._lwd_mixed and not self._lwd_has_prefill_chunk_inflight():
-            pending_cloud = sum(
-                1 for rid in self._lwd_awaiting
-                if rid not in self._lwd_first_token_seen
-            )
-            if pending_cloud >= _LWD_MAX_PENDING_PREFILL:
+            pending_chunks = len(self._lwd_batch_requests)
+            if pending_chunks >= _LWD_MAX_PENDING_CHUNKS:
                 if not self._lwd_prefill_gate_held:
                     self._lwd_prefill_gate_held = True
                     logger.info(
                         "[Lwd][edge-sched] prefill gate HOLD: "
-                        "pending_cloud=%d >= %d",
-                        pending_cloud, _LWD_MAX_PENDING_PREFILL,
+                        "pending_chunks=%d >= %d",
+                        pending_chunks, _LWD_MAX_PENDING_CHUNKS,
                     )
                 return SchedulerOutput.make_empty()
             if self._lwd_prefill_gate_held:
                 self._lwd_prefill_gate_held = False
                 logger.info(
-                    "[Lwd][edge-sched] prefill gate OPEN: pending_cloud=%d",
-                    pending_cloud,
+                    "[Lwd][edge-sched] prefill gate OPEN: pending_chunks=%d",
+                    pending_chunks,
                 )
         return self._lwd_schedule_batch()
 
@@ -550,6 +552,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         ):
             return False
         self._lwd_seqno = seqno + 1
+        self._lwd_batch_requests[seqno] = list(req_ids)
         logger.info(
             "[Lwd][edge-notify] batch reqs=%d tokens=%d seqno=%d mrope=%d",
             len(items), sum(item.num_tokens for item in items), seqno,
@@ -645,6 +648,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_awaiting.pop(request_id, None)
             self._lwd_first_token_seen.discard(request_id)
             self._lwd_mrope_positions_dict.pop(request_id, None)
+            seen = self._lwd_first_token_seen
+            for seqno, rids in list(self._lwd_batch_requests.items()):
+                rids = [rid for rid in rids if rid != request_id]
+                if not rids or all(rid in seen for rid in rids):
+                    del self._lwd_batch_requests[seqno]
+                else:
+                    self._lwd_batch_requests[seqno] = rids
             if publisher is None:
                 continue
             if not publisher.publish(LwdAbortNotify(request_id=request_id)):
@@ -708,6 +718,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             return False
         self._lwd_first_token_seen.add(request_id)
+        seen = self._lwd_first_token_seen
+        for seqno, rids in list(self._lwd_batch_requests.items()):
+            if all(rid in seen for rid in rids):
+                del self._lwd_batch_requests[seqno]
         if finished:
             del self._lwd_awaiting[request_id]
             self._lwd_first_token_seen.discard(request_id)
