@@ -65,6 +65,13 @@ logger = init_logger(__name__)
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
 
+# 云侧 pending 上限,按未消费 chunk(seqno)计:一条 seqno = 一个云步
+# 消费单位。边侧记录 seqno -> 批内请求列表,批内全部请求收到首 token
+# 即该 chunk 已消费;未消费 chunk 数达到上限即停止新开 prefill——请求
+# 在边侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧 pending
+# 排空后闸门自开。
+_LWD_MAX_PENDING_CHUNKS = 3
+
 
 class LwdEdgeScheduler(LwdBaseScheduler):
     """纯 prefill 调度语义 + 控制面出口(notify/abort/seqno)。"""
@@ -102,6 +109,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
+        # 已收到首个 token 的请求集合:awaiting 中不在此集合的请求 =
+        # 云侧尚未消费到其 prefill(pending_notify 的边侧本地估计,
+        # 免新增协议字段);首个 c2e 到达即标记,完结/abort 时清除。
+        self._lwd_first_token_seen: set[str] = set()
+        # seqno -> 批内 request_id 列表(chunk 粒度 pending 跟踪):
+        # 批内全部请求收到首 token 即整条移除;abort 时按请求摘除,
+        # 摘空即移除。云侧 pending_notify 的边侧本地镜像,免协议改动。
+        self._lwd_batch_requests: dict[int, list[str]] = {}
+        # pending 闸门状态(仅作开/关转换日志用)
+        self._lwd_prefill_gate_held: bool = False
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
         # 同样占预算与 KV);k = num_speculative_tokens(配置解析期已
         # 求值,缺省 None 按 0),无 spec 配置即 1。
@@ -171,6 +188,28 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             and not self._lwd_has_prefill_chunk_inflight()
         ):
             return SchedulerOutput.make_empty()
+        # 云侧 pending 闸门(组批的产生机制):awaiting 中尚未收到首个
+        # token 的请求数 = 云侧尚未消费到的 prefill(notify 积压的边侧
+        # 本地估计,免协议改动)。超过上限即停止新开 prefill,请求在边
+        # 侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧
+        # pending 排空后闸门自开。续传豁免(先收尾再开新)。
+        if self._lwd_mixed and not self._lwd_has_prefill_chunk_inflight():
+            pending_chunks = len(self._lwd_batch_requests)
+            if pending_chunks >= _LWD_MAX_PENDING_CHUNKS:
+                if not self._lwd_prefill_gate_held:
+                    self._lwd_prefill_gate_held = True
+                    logger.info(
+                        "[Lwd][edge-sched] prefill gate HOLD: "
+                        "pending_chunks=%d >= %d",
+                        pending_chunks, _LWD_MAX_PENDING_CHUNKS,
+                    )
+                return SchedulerOutput.make_empty()
+            if self._lwd_prefill_gate_held:
+                self._lwd_prefill_gate_held = False
+                logger.info(
+                    "[Lwd][edge-sched] prefill gate OPEN: pending_chunks=%d",
+                    pending_chunks,
+                )
         return self._lwd_schedule_batch()
 
     def _lwd_pick_prefill_batch(
@@ -424,6 +463,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         mrope_features = [
             f for f in request.mm_features if f.modality != "prompt_embeds"
         ]
+        _t_mrope = time.monotonic()
         positions, _delta = self._lwd_mrope_positions_fn(
             input_tokens=list(request.prompt_token_ids),
             mm_features=mrope_features,
@@ -434,9 +474,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             f"len {request.num_prompt_tokens} (request {request.request_id})"
         )
         self._lwd_mrope_positions_dict[request.request_id] = positions
+        # [Lwd][perf] mrope 全 prompt 计算逐请求耗时(在边引擎主线程上,
+        # 期间调度循环停转;MM 劣化归因)
         logger.info(
-            "[Lwd][edge-sched] mrope positions computed: req=%s prompt=%d",
+            "[Lwd][perf] mrope-compute req=%s prompt=%d dur=%.2fms",
             request.request_id, request.num_prompt_tokens,
+            (time.monotonic() - _t_mrope) * 1000,
         )
 
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
@@ -509,6 +552,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         ):
             return False
         self._lwd_seqno = seqno + 1
+        self._lwd_batch_requests[seqno] = list(req_ids)
         logger.info(
             "[Lwd][edge-notify] batch reqs=%d tokens=%d seqno=%d mrope=%d",
             len(items), sum(item.num_tokens for item in items), seqno,
@@ -602,7 +646,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         publisher = self.lwd_edge_publisher
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
+            self._lwd_first_token_seen.discard(request_id)
             self._lwd_mrope_positions_dict.pop(request_id, None)
+            seen = self._lwd_first_token_seen
+            for seqno, rids in list(self._lwd_batch_requests.items()):
+                rids = [rid for rid in rids if rid != request_id]
+                if not rids or all(rid in seen for rid in rids):
+                    del self._lwd_batch_requests[seqno]
+                else:
+                    self._lwd_batch_requests[seqno] = rids
             if publisher is None:
                 continue
             if not publisher.publish(LwdAbortNotify(request_id=request_id)):
@@ -665,8 +717,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 request_id,
             )
             return False
+        self._lwd_first_token_seen.add(request_id)
+        seen = self._lwd_first_token_seen
+        for seqno, rids in list(self._lwd_batch_requests.items()):
+            if all(rid in seen for rid in rids):
+                del self._lwd_batch_requests[seqno]
         if finished:
             del self._lwd_awaiting[request_id]
+            self._lwd_first_token_seen.discard(request_id)
         logger.info(
             "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
             request_id, len(token_ids), finished,
